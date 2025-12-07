@@ -10,15 +10,19 @@ import numpy as np
 from ultralytics import YOLO
 from datetime import datetime
 import json
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import base64
 from io import BytesIO
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
 
 app = FastAPI()
 
-# CORS Middleware
+supabase_url = os.getenv("VITE_SUPABASE_URL")
+supabase_key = os.getenv("VITE_SUPABASE_SUPABASE_ANON_KEY")
+supabase: Client = create_client(supabase_url, supabase_key)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,16 +31,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======================== MODELS ========================
 class CameraConfig(BaseModel):
-    source_type: str  # "webcam", "rtsp", "upload"
+    source_type: str
     rtsp_url: Optional[str] = None
     video_file: Optional[str] = None
 
 class Rule(BaseModel):
     rule_id: Optional[str] = None
     name: str
-    object_type: str  # "person", "animal", "vehicle"
+    object_type: str
     threshold: int
 
 class AlertSettings(BaseModel):
@@ -49,7 +52,6 @@ class Alert(BaseModel):
     count: int
     message: str
 
-# ======================== GLOBAL STATE ========================
 camera_config = None
 is_streaming = False
 current_detections = {
@@ -58,17 +60,11 @@ current_detections = {
     "vehicle": 0,
     "timestamp": None
 }
-rules = []
-alerts = []
-alert_settings = {"emails": []}
 connected_clients = []
 
-# Load YOLO model
 model = YOLO("yolov8n.pt")
 
-# ======================== HELPER FUNCTIONS ========================
 def map_yolo_to_category(class_name):
-    """Map YOLO class names to our categories"""
     class_name = class_name.lower()
     if "person" in class_name or "human" in class_name:
         return "person"
@@ -79,10 +75,9 @@ def map_yolo_to_category(class_name):
     return None
 
 def run_detection(frame):
-    """Run YOLO detection on frame"""
     results = model(frame, verbose=False)
     detections = {"person": 0, "animal": 0, "vehicle": 0}
-    
+
     boxes = []
     for result in results:
         for box in result.boxes:
@@ -96,11 +91,10 @@ def run_detection(frame):
                     "coords": [int(x1), int(y1), int(x2), int(y2)],
                     "confidence": float(box.conf[0])
                 })
-    
+
     return detections, boxes
 
 def draw_boxes(frame, boxes):
-    """Draw bounding boxes on frame"""
     colors = {"person": (0, 255, 0), "animal": (255, 0, 0), "vehicle": (0, 0, 255)}
     for box in boxes:
         x1, y1, x2, y2 = box["coords"]
@@ -111,60 +105,62 @@ def draw_boxes(frame, boxes):
     return frame
 
 def encode_frame(frame):
-    """Encode frame to base64"""
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def send_alert_email(rule_name, object_type, count, emails):
-    """Send alert email"""
+async def send_alert_email(rule_name, object_type, count, emails):
     try:
-        sender_email = os.getenv("SENDER_EMAIL", "test@example.com")
-        sender_password = os.getenv("SENDER_PASSWORD", "password")
-        
-        subject = f"🚨 Intruder Alert: {rule_name}"
+        sender_email = os.getenv("SENDER_EMAIL", "intruder-detection@system.com")
+        subject = f"Intruder Alert: {rule_name}"
         body = f"""
         Alert Triggered!
-        
+
         Rule: {rule_name}
         Object Type: {object_type}
         Count: {count}
         Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        
+
         Please check your system immediately.
         """
-        
-        # For demo, we'll just log it
-        print(f"[EMAIL] Would send to {emails}: {subject}")
+
+        print(f"[EMAIL ALERT] To: {emails} | Rule: {rule_name} | Count: {count}")
         return True
     except Exception as e:
         print(f"Email error: {e}")
         return False
 
-def check_rules():
-    """Check if any rules are triggered"""
-    global alerts, current_detections
-    
-    for rule in rules:
-        count = current_detections.get(rule["object_type"], 0)
-        if count > rule["threshold"]:
-            alert = {
-                "timestamp": datetime.now().isoformat(),
-                "rule_name": rule["name"],
-                "object_type": rule["object_type"],
-                "count": count,
-                "message": f"Alert: {rule['name']} - {rule['object_type']} count ({count}) exceeded threshold ({rule['threshold']})"
-            }
-            alerts.append(alert)
-            alerts = alerts[-50:]  # Keep last 50 alerts
-            
-            if alert_settings["emails"]:
-                send_alert_email(rule["name"], rule["object_type"], count, alert_settings["emails"])
-            
-            # Notify connected websocket clients
-            asyncio.create_task(broadcast_alert(alert))
+async def check_rules():
+    global current_detections
+
+    try:
+        response = supabase.table("detection_rules").select("*").eq("is_active", True).execute()
+        rules = response.data
+
+        response = supabase.table("alert_settings").select("email").eq("is_active", True).execute()
+        emails = [item["email"] for item in response.data]
+
+        for rule in rules:
+            count = current_detections.get(rule["object_type"], 0)
+            if count > rule["threshold"]:
+                alert_data = {
+                    "rule_id": rule["id"],
+                    "rule_name": rule["name"],
+                    "object_type": rule["object_type"],
+                    "count": count,
+                    "message": f"Alert: {rule['name']} - {rule['object_type']} count ({count}) exceeded threshold ({rule['threshold']})"
+                }
+
+                supabase.table("alerts").insert(alert_data).execute()
+
+                if emails:
+                    await send_alert_email(rule["name"], rule["object_type"], count, emails)
+
+                alert_data["timestamp"] = datetime.now().isoformat()
+                await broadcast_alert(alert_data)
+    except Exception as e:
+        print(f"Error checking rules: {e}")
 
 async def broadcast_alert(alert):
-    """Broadcast alert to all connected websocket clients"""
     for client in connected_clients:
         try:
             await client.send_json({"type": "alert", "data": alert})
@@ -172,29 +168,37 @@ async def broadcast_alert(alert):
             pass
 
 async def process_stream(cap):
-    """Process video stream"""
     global is_streaming, current_detections
-    
+
     frame_count = 0
     while is_streaming:
         ret, frame = cap.read()
         if not ret:
             break
-        
+
         frame = cv2.resize(frame, (640, 480))
         detections, boxes = run_detection(frame)
         frame = draw_boxes(frame, boxes)
-        
+
         current_detections = {
             "person": detections["person"],
             "animal": detections["animal"],
             "vehicle": detections["vehicle"],
             "timestamp": datetime.now().isoformat()
         }
-        
-        check_rules()
-        
-        # Broadcast frame to websockets every 3 frames
+
+        await check_rules()
+
+        if frame_count % 30 == 0:
+            try:
+                supabase.table("detection_logs").insert({
+                    "person_count": detections["person"],
+                    "animal_count": detections["animal"],
+                    "vehicle_count": detections["vehicle"]
+                }).execute()
+            except:
+                pass
+
         if frame_count % 3 == 0:
             encoded_frame = encode_frame(frame)
             for client in connected_clients:
@@ -206,85 +210,116 @@ async def process_stream(cap):
                     })
                 except:
                     pass
-        
+
         frame_count += 1
         await asyncio.sleep(0.01)
 
-# ======================== API ENDPOINTS ========================
-
 @app.post("/configure_camera")
-async def configure_camera(config: CameraConfig):
-    """Configure camera source"""
+async def configure_camera_endpoint(config: CameraConfig):
     global camera_config
     camera_config = config
+
+    try:
+        supabase.table("camera_configs").update({"is_active": False}).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+
+        supabase.table("camera_configs").insert({
+            "source_type": config.source_type,
+            "rtsp_url": config.rtsp_url,
+            "video_file": config.video_file,
+            "is_active": True
+        }).execute()
+    except Exception as e:
+        print(f"Error saving camera config: {e}")
+
     return {"status": "success", "message": "Camera configured"}
 
 @app.post("/start_stream")
 async def start_stream():
-    """Start video stream"""
-    global is_streaming, camera_config, connected_clients
-    
+    global is_streaming, camera_config
+
     if is_streaming:
         return {"status": "error", "message": "Stream already running"}
-    
+
     if not camera_config:
         return {"status": "error", "message": "Camera not configured"}
-    
+
     is_streaming = True
-    
+
     if camera_config.source_type == "webcam":
         cap = cv2.VideoCapture(0)
     elif camera_config.source_type == "rtsp":
         cap = cv2.VideoCapture(camera_config.rtsp_url)
     elif camera_config.source_type == "upload":
         cap = cv2.VideoCapture(camera_config.video_file)
-    
+
     asyncio.create_task(process_stream(cap))
     return {"status": "success", "message": "Stream started"}
 
 @app.post("/stop_stream")
 async def stop_stream():
-    """Stop video stream"""
     global is_streaming
     is_streaming = False
     return {"status": "success", "message": "Stream stopped"}
 
 @app.get("/get_detections")
 async def get_detections():
-    """Get current detections"""
     return current_detections
 
 @app.post("/create_rule")
-async def create_rule(rule: Rule):
-    """Create detection rule"""
-    if not rule.rule_id:
-        rule.rule_id = f"rule_{len(rules) + 1}"
-    
-    rules.append(rule.model_dump())
-    return {"status": "success", "rule_id": rule.rule_id}
+async def create_rule_endpoint(rule: Rule):
+    try:
+        response = supabase.table("detection_rules").insert({
+            "name": rule.name,
+            "object_type": rule.object_type,
+            "threshold": rule.threshold,
+            "is_active": True
+        }).execute()
+
+        return {"status": "success", "rule_id": response.data[0]["id"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_rules")
 async def get_rules():
-    """Get all rules"""
-    return rules
+    try:
+        response = supabase.table("detection_rules").select("*").eq("is_active", True).order("created_at", desc=True).execute()
+        rules_data = []
+        for rule in response.data:
+            rules_data.append({
+                "rule_id": rule["id"],
+                "name": rule["name"],
+                "object_type": rule["object_type"],
+                "threshold": rule["threshold"]
+            })
+        return rules_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/delete_rule/{rule_id}")
 async def delete_rule(rule_id: str):
-    """Delete a rule"""
-    global rules
-    rules = [r for r in rules if r.get("rule_id") != rule_id]
-    return {"status": "success"}
+    try:
+        supabase.table("detection_rules").update({"is_active": False}).eq("id", rule_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/configure_alerts")
 async def configure_alerts(settings: AlertSettings):
-    """Configure alert email settings"""
-    global alert_settings
-    alert_settings = {"emails": settings.emails}
-    return {"status": "success"}
+    try:
+        for email in settings.emails:
+            try:
+                supabase.table("alert_settings").insert({
+                    "email": email,
+                    "is_active": True
+                }).execute()
+            except:
+                pass
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/send_test_email")
 async def send_test_email(emails: List[str]):
-    """Send test email"""
     try:
         for email in emails:
             print(f"[TEST EMAIL] Sending to {email}")
@@ -294,12 +329,23 @@ async def send_test_email(emails: List[str]):
 
 @app.get("/get_alerts")
 async def get_alerts(limit: int = 20):
-    """Get recent alerts"""
-    return alerts[-limit:]
+    try:
+        response = supabase.table("alerts").select("*").order("created_at", desc=True).limit(limit).execute()
+        alerts_data = []
+        for alert in response.data:
+            alerts_data.append({
+                "timestamp": alert["created_at"],
+                "rule_name": alert["rule_name"],
+                "object_type": alert["object_type"],
+                "count": alert["count"],
+                "message": alert["message"]
+            })
+        return alerts_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/test_connection")
 async def test_connection(config: CameraConfig):
-    """Test camera connection"""
     try:
         if config.source_type == "webcam":
             cap = cv2.VideoCapture(0)
@@ -307,10 +353,10 @@ async def test_connection(config: CameraConfig):
             cap = cv2.VideoCapture(config.rtsp_url)
         elif config.source_type == "upload":
             cap = cv2.VideoCapture(config.video_file)
-        
+
         ret, _ = cap.read()
         cap.release()
-        
+
         if ret:
             return {"status": "success", "message": "Connection successful"}
         else:
@@ -320,10 +366,9 @@ async def test_connection(config: CameraConfig):
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
-    """WebSocket endpoint for live stream"""
     await websocket.accept()
     connected_clients.append(websocket)
-    
+
     try:
         while True:
             await websocket.receive_text()
@@ -332,7 +377,6 @@ async def websocket_stream(websocket: WebSocket):
 
 @app.get("/health")
 async def health():
-    """Health check"""
     return {"status": "ok"}
 
 if __name__ == "__main__":
